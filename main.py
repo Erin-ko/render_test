@@ -1,6 +1,13 @@
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, List
+from sqlalchemy.orm import Session
+
+from database import Base, engine, get_db
+from models import BookDB
+
+# Create tables in the database if they don't already exist
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Books CRUD API",
@@ -8,7 +15,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Pydantic Schemas
+# Pydantic Schemas for Request/Response validation
 class BookBase(BaseModel):
     title: str = Field(..., json_schema_extra={"example": "The Great Gatsby"})
     author: str = Field(..., json_schema_extra={"example": "F. Scott Fitzgerald"})
@@ -29,9 +36,8 @@ class BookUpdate(BaseModel):
 class Book(BookBase):
     id: int
 
-# In-memory database
-books_db: dict[int, dict] = {}
-current_id: int = 0
+    class Config:
+        from_attributes = True
 
 @app.get("/")
 def read_root():
@@ -44,56 +50,59 @@ def health_check():
 # CRUD Endpoints
 
 @app.post("/books", response_model=Book, status_code=status.HTTP_201_CREATED)
-def create_book(book_in: BookCreate):
-    global current_id
-    current_id += 1
-    new_book = book_in.model_dump()
-    new_book["id"] = current_id
-    books_db[current_id] = new_book
-    return new_book
+def create_book(book_in: BookCreate, db: Session = Depends(get_db)):
+    db_book = BookDB(**book_in.model_dump())
+    db.add(db_book)
+    db.commit()
+    db.refresh(db_book)
+    return db_book
 
 @app.get("/books", response_model=List[Book])
-def get_books(author: Optional[str] = None, genre: Optional[str] = None):
-    results = list(books_db.values())
+def get_books(author: Optional[str] = None, genre: Optional[str] = None, db: Session = Depends(get_db)):
+    query = db.query(BookDB)
     if author:
-        results = [b for b in results if author.lower() in b["author"].lower()]
+        query = query.filter(BookDB.author.ilike(f"%{author}%"))
     if genre:
-        results = [b for b in results if genre.lower() in b["genre"].lower()]
-    return results
+        query = query.filter(BookDB.genre.ilike(f"%{genre}%"))
+    return query.all()
 
 @app.get("/books/{book_id}", response_model=Book)
-def get_book(book_id: int):
-    if book_id not in books_db:
+def get_book(book_id: int, db: Session = Depends(get_db)):
+    db_book = db.query(BookDB).filter(BookDB.id == book_id).first()
+    if not db_book:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Book with ID {book_id} not found"
         )
-    return books_db[book_id]
+    return db_book
 
 @app.put("/books/{book_id}", response_model=Book)
-def update_book(book_id: int, book_in: BookUpdate):
-    if book_id not in books_db:
+def update_book(book_id: int, book_in: BookUpdate, db: Session = Depends(get_db)):
+    db_book = db.query(BookDB).filter(BookDB.id == book_id).first()
+    if not db_book:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Book with ID {book_id} not found"
         )
     
-    existing_book = books_db[book_id]
     update_data = book_in.model_dump(exclude_unset=True)
-    
     for key, value in update_data.items():
-        existing_book[key] = value
+        setattr(db_book, key, value)
         
-    books_db[book_id] = existing_book
-    return existing_book
+    db.commit()
+    db.refresh(db_book)
+    return db_book
 
 @app.delete("/books/{book_id}", response_model=Book)
-def delete_book(book_id: int):
-    if book_id not in books_db:
+def delete_book(book_id: int, db: Session = Depends(get_db)):
+    db_book = db.query(BookDB).filter(BookDB.id == book_id).first()
+    if not db_book:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Book with ID {book_id} not found"
         )
-    deleted_book = books_db.pop(book_id)
-    return deleted_book
+    db.delete(db_book)
+    db.commit()
+    return db_book
+
 
